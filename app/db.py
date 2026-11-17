@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ports (
@@ -104,6 +104,48 @@ CREATE TABLE IF NOT EXISTS event_changes (
 
 CREATE INDEX IF NOT EXISTS idx_event_changes_port_seq
     ON event_changes (port_id, seq);
+
+-- Emission ledgers are immutable once published.  They deliberately do NOT
+-- reference events(id) with a foreign key: a late upload may retract an event
+-- after a ledger was published, and the ledger must keep its evidence (event
+-- id, allocated seconds, factor) exactly as it was at publish time.
+CREATE TABLE IF NOT EXISTS emission_ledgers (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    port_id        INTEGER NOT NULL REFERENCES ports(id),
+    delivery_no    TEXT    NOT NULL,
+    ledger_date    TEXT    NOT NULL,
+    day_start      INTEGER NOT NULL,
+    day_end        INTEGER NOT NULL,
+    request_sha256 TEXT    NOT NULL,
+    vessel_count   INTEGER NOT NULL,
+    total_grams    INTEGER NOT NULL,
+    published_at   TEXT    NOT NULL,
+    UNIQUE (port_id, delivery_no)
+);
+
+CREATE TABLE IF NOT EXISTS emission_ledger_vessels (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    ledger_id             INTEGER NOT NULL REFERENCES emission_ledgers(id),
+    vessel_id             TEXT    NOT NULL,
+    factor_grams_per_hour TEXT    NOT NULL,
+    allocated_seconds     INTEGER NOT NULL,
+    emission_grams        INTEGER NOT NULL,
+    UNIQUE (ledger_id, vessel_id)
+);
+
+CREATE TABLE IF NOT EXISTS emission_ledger_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    ledger_id             INTEGER NOT NULL REFERENCES emission_ledgers(id),
+    vessel_id             TEXT    NOT NULL,
+    event_id              INTEGER NOT NULL,
+    event_start           INTEGER NOT NULL,
+    event_end             INTEGER NOT NULL,
+    allocated_seconds     INTEGER NOT NULL,
+    factor_grams_per_hour TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_emission_ledger_events_ledger
+    ON emission_ledger_events (ledger_id, vessel_id);
 
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,

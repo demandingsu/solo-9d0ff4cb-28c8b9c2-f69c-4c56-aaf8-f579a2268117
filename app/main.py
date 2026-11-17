@@ -2,15 +2,16 @@ import hashlib
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager, contextmanager
+from datetime import date as date_type
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated, Iterator
 
 from fastapi import Depends, FastAPI, File, Header, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from . import __version__, csv_ingest, db, service
+from . import __version__, csv_ingest, db, ledgers, service
 from .config import Settings
 from .errors import AppError
 
@@ -54,6 +55,63 @@ class PortIn(BaseModel):
         )
 
 
+class LedgerFactorIn(BaseModel):
+    vessel_id: str = Field(min_length=1, max_length=128, examples=["SHIP-001"])
+    grams_per_hour: Decimal = Field(
+        examples=[1250.5],
+        description="该船靠泊小时排放因子（克/小时），非负有限数",
+    )
+
+    @field_validator("vessel_id")
+    @classmethod
+    def _strip_vessel(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("vessel_id must not be blank")
+        return value
+
+    @field_validator("grams_per_hour")
+    @classmethod
+    def _check_factor(cls, value: Decimal) -> Decimal:
+        if not value.is_finite():
+            raise ValueError("grams_per_hour must be a finite number")
+        if value < 0:
+            raise ValueError("grams_per_hour must be >= 0")
+        if value > Decimal("1000000000000"):
+            raise ValueError("grams_per_hour must be <= 1e12")
+        return value
+
+
+class LedgerPublishIn(BaseModel):
+    delivery_no: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        examples=["DEL-2026-0101-001"],
+        description="交付号：港区内唯一，重试原样返回，异内容 409",
+    )
+    date: date_type = Field(
+        examples=["2026-01-01"],
+        description="UTC 日期；计量窗口为当日 [00:00, 次日00:00) 半开区间",
+    )
+    factors: list[LedgerFactorIn] = Field(
+        min_length=1,
+        max_length=10_000,
+        description="各船每小时排放克数；当日有停留的船必须全部覆盖",
+    )
+
+    @model_validator(mode="after")
+    def _unique_vessels(self) -> "LedgerPublishIn":
+        seen: set[str] = set()
+        for factor in self.factors:
+            if factor.vessel_id in seen:
+                raise ValueError(
+                    f"duplicate factor for vessel {factor.vessel_id!r}"
+                )
+            seen.add(factor.vessel_id)
+        return self
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings.from_env()
 
@@ -79,7 +137,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "- 停留首末相距 ≥ 30 分钟才形成事件。\n"
             "- 迟到点改变事件时，未变事件保留 event_id；被改变事件按旧号撤回"
             "（retract），新事件以新号加入（upsert）。变更按 `seq` 游标顺序读取。\n"
-            "- 每次上传的原始点、现役事件、变更记录在同一个 SQLite 写事务中提交。\n\n"
+            "- 每次上传的原始点、现役事件、变更记录在同一个 SQLite 写事务中提交。\n"
+            "- 排放日账：按交付号发布某 UTC 日期的靠泊排放账；按现役停留事件与"
+            "当日 [00:00, 次日00:00) 半开区间的交集秒数 × 各船因子（克/小时）计量，"
+            "逐船四舍五入到克，港区总数为船级之和。日账保存事件编号、分摊秒数与"
+            "因子作为依据，发布后即不可变。\n\n"
             "**在 /docs 演示迟到补点与撤回**：展开 `POST /demo/run`，点击 "
             "Try it out -> Execute。响应内含修改前后事件、retract/upsert 变更"
             "及保留编号的事件，可直接观察。"
@@ -89,6 +151,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {"name": "uploads", "description": "CSV 点位上传（原子、幂等）"},
             {"name": "events", "description": "当前现役靠港停留事件"},
             {"name": "changes", "description": "按游标顺序读取的事件变更流"},
+            {"name": "ledgers", "description": "靠泊排放日账签发与回查"},
             {"name": "demo", "description": "迟到补点与撤回演示"},
             {"name": "system", "description": "健康检查"},
         ],
@@ -347,6 +410,74 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return service.list_changes(
                 conn, port_code=port_code, after=after, limit=limit
             )
+
+    @app.post(
+        "/ports/{port_code}/emission-ledgers",
+        tags=["ledgers"],
+        status_code=201,
+        summary="签发靠泊排放日账（按交付号幂等）",
+        description=(
+            "为港区与指定 UTC 日期签发排放日账。计量口径：现役停留事件与当日 "
+            "[00:00, 次日00:00) 半开区间的交集秒数 × 各船因子（克/小时），"
+            "逐船累加后四舍五入到克，港区总数为船级结果之和。\n\n"
+            "日账保存事件编号、分摊秒数与因子作为依据，发布后不可变；"
+            "迟到补点改变停留后，请用新的交付号签发，旧账保持原样。\n\n"
+            "同一交付号 + 同一输入重试返回原账（200, replayed=true）；"
+            "同一交付号不同内容返回 409；当日有停留的船缺少因子时整次拒收"
+            "（422），不留下半份日账。"
+        ),
+        responses={
+            200: {"description": "同一交付号与同一输入重试，返回原账"},
+            201: {"description": "日账已原子签发"},
+            409: {"description": "交付号已被不同内容使用"},
+            422: {"description": "有停留的船舶缺少排放因子，整次拒收"},
+        },
+    )
+    def publish_emission_ledger(
+        port_code: str, body: LedgerPublishIn, conn: Db
+    ) -> JSONResponse:
+        # Sync endpoint on purpose, like uploads: the whole measurement and
+        # all ledger rows commit in one BEGIN IMMEDIATE transaction, so an
+        # interleaved upload from another instance is either fully measured
+        # or not measured at all, and a failure leaves no partial ledger.
+        factors = [
+            (factor.vessel_id, ledgers.canonical_factor(factor.grams_per_hour))
+            for factor in body.factors
+        ]
+        ledger, replayed = ledgers.publish_ledger(
+            conn,
+            port_code=port_code,
+            delivery_no=body.delivery_no,
+            ledger_date=body.date,
+            factors=factors,
+        )
+        return JSONResponse(
+            status_code=200 if replayed else 201,
+            content={"replayed": replayed, "ledger": ledger},
+        )
+
+    @app.get(
+        "/ports/{port_code}/emission-ledgers/{delivery_no}",
+        tags=["ledgers"],
+        summary="按交付号回查日账",
+        description=(
+            "返回日账及其全部依据：逐船的因子、分摊秒数、排放量（克），"
+            "以及每条现役事件切片的事件编号与分摊秒数。日账为发布时快照，"
+            "即使相关事件后来被迟到补点撤回，依据也保持原样。"
+        ),
+        responses={404: {"description": "港区或交付号不存在"}},
+    )
+    def read_emission_ledger(
+        port_code: str,
+        delivery_no: str,
+        conn: Db,
+    ) -> dict:
+        with db.read_snapshot(conn):
+            return {
+                "ledger": ledgers.get_ledger(
+                    conn, port_code=port_code, delivery_no=delivery_no
+                )
+            }
 
     if resolved.demo_enabled:
 

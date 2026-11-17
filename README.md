@@ -1,7 +1,8 @@
 # 港航 AIS 靠港停留事件 API
 
 岸基 AIS 点位 → 靠港停留事件，供排放核算使用。FastAPI + SQLite（WAL），
-提供 Docker Compose 启动、CSV 上传、事件查询与游标变更流。
+提供 Docker Compose 启动、CSV 上传、事件查询与游标变更流，以及按交付号
+签发、回查的靠泊排放日账。
 
 ## 快速开始
 
@@ -41,6 +42,12 @@ docker compose -f docker-compose.dual.yml up --build
 | 两实例交错上传不丢更新 | SQLite WAL + `BEGIN IMMEDIATE` 写串行化 |
 | 失败不推进游标 | 事务回滚，`seq` 不前进，无半批结果 |
 | 重复上传不重发变更 | `Idempotency-Key`（缺省用内容 SHA-256）唯一约束，重放返回原批次 |
+| 排放日账计量 | 现役停留事件 ∩ 当日 UTC `[00:00, 次日00:00)` 半开区间的秒数 × 各船因子（克/小时） |
+| 逐船舍入、港区求和 | 每船按精确分数累加后四舍五入到克；港区总数为船级结果之和，不再二次舍入 |
+| 日账依据留痕 | 日账保存事件编号、分摊秒数与因子；发布后不可变，迟到补点不改旧账 |
+| 缺因子整次拒收 | 当日有停留的船缺少因子时返回 422 `missing_emission_factor`，不留半份日账 |
+| 交付号幂等 | `(港区, delivery_no)` 唯一；同内容重试返回原账（200），异内容 409 |
+| 发布原子性 | 计量读取与账本写入在同一 `BEGIN IMMEDIATE` 事务提交，与上传交错不混用新旧事件 |
 
 ### 事件编号语义
 
@@ -71,6 +78,8 @@ epoch 秒/毫秒。坐标按 1e-6 度取整后比较。上传上限默认 10 MiB
 | POST | `/ports/{code}/uploads` | 上传 CSV 点位，整批原子生效 |
 | GET | `/ports/{code}/events` | 现役事件，按 `event_id` 分页 |
 | GET | `/ports/{code}/changes` | 变更流，`after` 游标 + `limit` |
+| POST | `/ports/{code}/emission-ledgers` | 签发某 UTC 日期的排放日账（按交付号幂等） |
+| GET | `/ports/{code}/emission-ledgers/{delivery_no}` | 按交付号回查日账及依据 |
 | POST | `/demo/run` | 迟到补点 / retract 演示（`AIS_DEMO_ENABLED=1`） |
 | GET | `/healthz` | 健康检查 |
 
@@ -106,6 +115,31 @@ epoch 秒/毫秒。坐标按 1e-6 度取整后比较。上传上限默认 10 MiB
 `seq` 在全库单调递增，同一港区的游标可能不连续；按 `seq > after` 读取即可。
 `GET /events` 返回的 `cursor` 与变更流同源，可用于「先快照、后增量」。
 
+### 排放日账
+
+签发请求示例（`POST /ports/CNSHA-PD/emission-ledgers`）：
+
+```json
+{
+  "delivery_no": "DEL-2026-0101-001",
+  "date": "2026-01-01",
+  "factors": [
+    {"vessel_id": "SHIP-001", "grams_per_hour": 1250.5},
+    {"vessel_id": "SHIP-002", "grams_per_hour": 800}
+  ]
+}
+```
+
+* `date` 为 UTC 日期，计量窗口是 `[当日00:00, 次日00:00)` 半开区间；
+  跨日停留按交集秒数自动拆到两侧日账（两侧需分别用各自交付号签发）。
+* 每船排放量 = 因子 × 分摊秒数 / 3600，按精确分数四舍五入到克；
+  `total_grams` 为各船舍入结果之和。
+* 响应与回查结果中，`vessels[].events[]` 给出逐事件依据：事件编号、
+  事件起止（epoch 秒）、分摊秒数与所用因子。事件被迟到补点撤回后，
+  旧日账的依据仍原样保留；用新交付号签发即按最新事件计量。
+* 当日无停留时可签发空账（`vessel_count=0`）；提交了因子但当日无停留的
+  船不计入日账。
+
 ## 本地开发与测试
 
 ```bash
@@ -116,8 +150,11 @@ AIS_DEMO_ENABLED=1 uvicorn app.main:app --reload
 
 测试覆盖：10 分钟/30 分钟边界、出港断开、批内与库内去重、异坐标整批回滚、
 迟到点 retract/upsert 与编号保留、两事件合并、幂等重放、游标分页、港区隔离、
-双实例（共享 DB 的并发线程与两个 FastAPI 实例）交错上传。`docker build`
-未能在本环境执行（无 Docker 守护进程），Compose 文件仅做了 YAML 解析校验。
+双实例（共享 DB 的并发线程与两个 FastAPI 实例）交错上传；日账的跨日拆分、
+边界对齐、逐船舍入与港区求和、缺因子整次拒收、交付号重放/冲突、迟到补点后
+旧账不变新账按最新事件、发布中途崩溃不留半账、上传与发布交错不混用事件状态、
+双实例签发/回查/重放。`docker build` 未能在本环境执行（无 Docker 守护进程），
+Compose 文件仅做了 YAML 解析校验。
 
 ## 配置
 
@@ -133,5 +170,7 @@ AIS_DEMO_ENABLED=1 uvicorn app.main:app --reload
 
 * 变更流只保留写入的记录、不提供保留期清理；长期运行需自行归档。
 * 事件推导按船全量重算该港区点位；单船超大数据量时应改为增量窗口。
+* 日账发布后不可更正；口径错误只能用新交付号另签新账，旧账需业务侧作废。
+* 日账不提供列表页，只能按交付号回查；交付号规则由核算侧自行管理。
 * SQLite 共享卷适用于单机多实例；跨主机需换成服务端数据库。
 * 不做鉴权；生产部署应置于反向代理/网关之后。
